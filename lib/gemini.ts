@@ -50,7 +50,7 @@ export async function predictRace(
   dateStr: string,
 ): Promise<RacePrediction> {
   const genAI = getClient()
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-8b' })
   const vd = VENUE_DATA[venueName] || { note: '標準水面', in1Rate: 54 }
   const rno = raceInfo.raceNo
   const in1Rate = rno <= 4 ? vd.in1Rate + 4 : rno >= 10 ? vd.in1Rate - 3 : vd.in1Rate
@@ -95,7 +95,7 @@ export async function predictWithExhibition(
   exhibition: ExhibitionData[],
 ): Promise<RacePrediction> {
   const genAI = getClient()
-  const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' })
+  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-8b' })
   const orig = basePrediction.ranking
     .map(p => `${p.rank}着:${p.lane}号艇${p.name}(${Math.round(p.confidence * 100)}%)`)
     .join(' ')
