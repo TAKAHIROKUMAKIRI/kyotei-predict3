@@ -9,25 +9,63 @@ const VENUE_NAMES: Record<number, string> = {
   13:'尼崎',14:'鳴門',15:'丸亀',16:'児島',17:'宮島',18:'徳山',
   19:'下関',20:'若松',21:'芦屋',22:'福岡',23:'唐津',24:'大村',
 }
-
 const GRADE_MAP: Record<number, string> = {1:'A1',2:'A2',3:'B1',4:'B2'}
 
-function calcScore(racer: any, lane: number, in1Rate: number) {
+// ④絞り込み対象
+const GOOD_VENUES = ['大村','若松','宮島','児島','住之江','蒲郡']
+const GOOD_RACES = [6,10,11]
+
+function calcScore(racer: any, lane: number, in1Rate: number, roughMode: boolean) {
   let score = 0
   score += (racer.natRate || 5.0) * 8
   score += (racer.localRate || 5.0) * 5
   score += (racer.motorRate || 40) * 0.3
-  const courseBias = [in1Rate, 18, 14, 10, 8, 6]
+  const courseBias = roughMode
+    ? [in1Rate * 0.5, 22, 20, 16, 14, 12]  // ①荒れモード：外枠を優遇
+    : [in1Rate, 18, 14, 10, 8, 6]
   score += courseBias[lane - 1] || 6
   const gradeBonus: Record<string,number> = { A1:15, A2:8, B1:0, B2:-8 }
   score += gradeBonus[racer.grade] || 0
   return score
 }
 
-function predict(boats: any[], venueName: string, raceNo: number) {
+function isHighConfidence(boats: any[], venueName: string, raceNo: number): boolean {
   const vd = VENUE_DATA[venueName] || { in1Rate: 54 }
-  const baseIn1 = vd.in1Rate
-  const in1Rate = raceNo <= 4 ? baseIn1 + 4 : raceNo >= 10 ? baseIn1 - 3 : baseIn1
+  const in1Rate = raceNo <= 4 ? vd.in1Rate + 4 : raceNo >= 10 ? vd.in1Rate - 3 : vd.in1Rate
+  const racers = boats.map(b => ({
+    lane: b.racer_boat_number,
+    grade: GRADE_MAP[b.racer_class_number] || 'B1',
+    natRate: parseFloat(b.racer_national_top_1_percent) || 5.0,
+    localRate: parseFloat(b.racer_local_top_1_percent) || 5.0,
+    motorRate: parseFloat(b.racer_assigned_motor_top_2_percent) || 40,
+  }))
+  const scores = racers.map(r => calcScore(r, r.lane, in1Rate, false))
+  const sorted = [...scores].sort((a,b) => b-a)
+  // 1位と2位のスコア差が大きい = 確信度高い
+  return (sorted[0] - sorted[1]) > 15
+}
+
+function isRoughRace(boats: any[], venueName: string, raceNo: number): boolean {
+  const vd = VENUE_DATA[venueName] || { in1Rate: 54 }
+  const in1Rate = raceNo <= 4 ? vd.in1Rate + 4 : raceNo >= 10 ? vd.in1Rate - 3 : vd.in1Rate
+  const racers = boats.map(b => ({
+    lane: b.racer_boat_number,
+    grade: GRADE_MAP[b.racer_class_number] || 'B1',
+    natRate: parseFloat(b.racer_national_top_1_percent) || 5.0,
+    localRate: parseFloat(b.racer_local_top_1_percent) || 5.0,
+    motorRate: parseFloat(b.racer_assigned_motor_top_2_percent) || 40,
+  }))
+  const scores = racers.map(r => calcScore(r, r.lane, in1Rate, false))
+  const ranked = racers.map((r,i) => ({...r, score: scores[i]})).sort((a,b) => b.score-a.score)
+  // 1コースが上位でない or 外枠に強い選手がいる
+  const lane1Rank = ranked.findIndex(r => r.lane === 1) + 1
+  const hasStrongOuter = ranked[0].lane >= 3
+  return lane1Rank > 2 || hasStrongOuter
+}
+
+function predict(boats: any[], venueName: string, raceNo: number, roughMode: boolean) {
+  const vd = VENUE_DATA[venueName] || { in1Rate: 54 }
+  const in1Rate = raceNo <= 4 ? vd.in1Rate + 4 : raceNo >= 10 ? vd.in1Rate - 3 : vd.in1Rate
   const racers = boats.map(b => ({
     lane: b.racer_boat_number,
     grade: GRADE_MAP[b.racer_class_number] || 'B1',
@@ -36,11 +74,12 @@ function predict(boats: any[], venueName: string, raceNo: number) {
     motorRate: parseFloat(b.racer_assigned_motor_top_2_percent) || 40,
   }))
   const ranked = racers
-    .map(r => ({ ...r, score: calcScore(r, r.lane, in1Rate) }))
+    .map(r => ({ ...r, score: calcScore(r, r.lane, in1Rate, roughMode) }))
     .sort((a, b) => b.score - a.score)
   return {
     honmei: `${ranked[0].lane}-${ranked[1].lane}`,
     taikou: `${ranked[0].lane}-${ranked[2]?.lane || ranked[1].lane}`,
+    sanrentan: `${ranked[0].lane}-${ranked[1].lane}-${ranked[2]?.lane}`,
   }
 }
 
@@ -51,13 +90,17 @@ function getActualResult(resultRace: any) {
   )
   const first = sorted[0]?.racer_boat_number
   const second = sorted[1]?.racer_boat_number
+  const third = sorted[2]?.racer_boat_number
   if (!first || !second) return null
-  return `${first}-${second}`
+  return {
+    exacta: `${first}-${second}`,
+    trifecta: `${first}-${second}-${third}`,
+  }
 }
 
-function getExactaPayout(result: any, combo: string) {
-  if (!result?.payouts?.exacta) return 0
-  for (const p of result.payouts.exacta) {
+function getPayout(result: any, type: 'exacta'|'trifecta', combo: string) {
+  if (!result?.payouts?.[type]) return 0
+  for (const p of result.payouts[type]) {
     if (p.combination === combo) return parseInt(p.payout || 0)
   }
   return 0
@@ -66,31 +109,34 @@ function getExactaPayout(result: any, combo: string) {
 function dateToStr(d: Date) {
   return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`
 }
-
 function getDateRange(months: number) {
   const dates = []
-  const end = new Date()
-  end.setDate(end.getDate() - 1)
-  const start = new Date(end)
-  start.setMonth(start.getMonth() - months)
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate()+1)) {
-    dates.push(dateToStr(new Date(d)))
-  }
+  const end = new Date(); end.setDate(end.getDate() - 1)
+  const start = new Date(end); start.setMonth(start.getMonth() - months)
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate()+1)) dates.push(dateToStr(new Date(d)))
   return dates
 }
-
 function roi(invest: number, payout: number) {
   if (!invest) return '0.0'
   return ((payout/invest)*100).toFixed(1)
 }
-
 function hitRate(wins: number, bets: number) {
   if (!bets) return '0.0'
   return ((wins/bets)*100).toFixed(1)
 }
 
+const STRATEGIES = [
+  { id:'1',   label:'① 荒れ狙い',       desc:'外枠有利レースのみ・2連単' },
+  { id:'2',   label:'② 確信度絞り',      desc:'スコア差が大きいレースのみ・2連単' },
+  { id:'3',   label:'③ 3連単',           desc:'全レース・3連単本命' },
+  { id:'4',   label:'④ 場・R絞り',       desc:'大村/若松/宮島等・6R/10R/11R・2連単' },
+  { id:'14',  label:'① ＋ ④',           desc:'荒れ狙い × 場・R絞り' },
+  { id:'24',  label:'② ＋ ④',           desc:'確信度絞り × 場・R絞り' },
+]
+
 export default function BacktestPage() {
   const [months, setMonths] = useState(3)
+  const [strategy, setStrategy] = useState('1')
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0, date: '' })
   const [result, setResult] = useState<any>(null)
@@ -98,21 +144,34 @@ export default function BacktestPage() {
 
   const addLog = (msg: string) => setLog(prev => [...prev.slice(-20), msg])
 
-  const run = async () => {
-    setRunning(true)
-    setResult(null)
-    setLog([])
+  const shouldBet = (boats: any[], venueName: string, raceNo: number): boolean => {
+    const venueOk = GOOD_VENUES.includes(venueName)
+    const raceOk = GOOD_RACES.includes(raceNo)
+    switch(strategy) {
+      case '1':  return isRoughRace(boats, venueName, raceNo)
+      case '2':  return isHighConfidence(boats, venueName, raceNo)
+      case '3':  return true
+      case '4':  return venueOk && raceOk
+      case '14': return isRoughRace(boats, venueName, raceNo) && venueOk && raceOk
+      case '24': return isHighConfidence(boats, venueName, raceNo) && venueOk && raceOk
+      default:   return true
+    }
+  }
 
+  const run = async () => {
+    setRunning(true); setResult(null); setLog([])
     const dates = getDateRange(months)
     setProgress({ current: 0, total: dates.length, date: '' })
+    const roughMode = strategy === '1' || strategy === '14'
+    const use3tan = strategy === '3'
 
     const stats = {
-      totalRaces: 0,
-      honmei: { bets:0, wins:0, payout:0 },
-      taikou: { bets:0, wins:0, payout:0 },
-      byVenue: {} as Record<string, any>,
-      byRaceNo: {} as Record<number, any>,
-      monthly: {} as Record<string, any>,
+      totalRaces: 0, bettedRaces: 0,
+      main: { bets:0, wins:0, payout:0 },
+      sub:  { bets:0, wins:0, payout:0 },
+      byVenue: {} as Record<string,any>,
+      byRaceNo: {} as Record<number,any>,
+      monthly: {} as Record<string,any>,
     }
 
     for (let i = 0; i < dates.length; i++) {
@@ -126,76 +185,83 @@ export default function BacktestPage() {
           fetch(`https://boatraceopenapi.github.io/programs/v2/${year}/${dateStr}.json`).then(r => r.ok ? r.json() : null),
           fetch(`https://boatraceopenapi.github.io/results/v2/${year}/${dateStr}.json`).then(r => r.ok ? r.json() : null),
         ])
-
         if (!programData || !resultData) continue
 
         const programs = programData.programs || []
         const results = resultData.results || resultData.programs || []
-
         const resultMap = new Map()
-        for (const r of results) {
-          resultMap.set(`${r.race_stadium_number}_${r.race_number}`, r)
-        }
+        for (const r of results) resultMap.set(`${r.race_stadium_number}_${r.race_number}`, r)
 
         for (const prog of programs) {
           if (!prog.boats || prog.boats.length < 6) continue
-          const key = `${prog.race_stadium_number}_${prog.race_number}`
-          const result = resultMap.get(key)
+          const result = resultMap.get(`${prog.race_stadium_number}_${prog.race_number}`)
           if (!result) continue
-
-          const actualCombo = getActualResult(result)
-          if (!actualCombo) continue
+          const actual = getActualResult(result)
+          if (!actual) continue
 
           const venueName = VENUE_NAMES[prog.race_stadium_number] || `場${prog.race_stadium_number}`
           const raceNo = prog.race_number
-          const pred = predict(prog.boats, venueName, raceNo)
-
-          const honmeiHit = pred.honmei === actualCombo
-          const taikouHit = pred.taikou === actualCombo
-          const honmeiPayout = honmeiHit ? getExactaPayout(result, actualCombo) : 0
-          const taikouPayout = taikouHit ? getExactaPayout(result, actualCombo) : 0
-
-          stats.honmei.bets++
-          stats.taikou.bets++
-          if (honmeiHit) { stats.honmei.wins++; stats.honmei.payout += honmeiPayout }
-          if (taikouHit) { stats.taikou.wins++; stats.taikou.payout += taikouPayout }
           stats.totalRaces++
 
-          if (!stats.byVenue[venueName]) stats.byVenue[venueName] = { bets:0, wins:0, invest:0, payout:0 }
-          stats.byVenue[venueName].bets += 2
-          stats.byVenue[venueName].invest += 200
-          if (honmeiHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += honmeiPayout }
-          if (taikouHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += taikouPayout }
+          if (!shouldBet(prog.boats, venueName, raceNo)) continue
+          stats.bettedRaces++
 
-          if (!stats.byRaceNo[raceNo]) stats.byRaceNo[raceNo] = { bets:0, wins:0, invest:0, payout:0 }
-          stats.byRaceNo[raceNo].bets += 2
-          stats.byRaceNo[raceNo].invest += 200
-          if (honmeiHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += honmeiPayout }
-          if (taikouHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += taikouPayout }
+          const pred = predict(prog.boats, venueName, raceNo, roughMode)
 
-          if (!stats.monthly[month]) stats.monthly[month] = { bets:0, wins:0, invest:0, payout:0 }
-          stats.monthly[month].bets += 2
-          stats.monthly[month].invest += 200
-          if (honmeiHit) { stats.monthly[month].wins++; stats.monthly[month].payout += honmeiPayout }
-          if (taikouHit) { stats.monthly[month].wins++; stats.monthly[month].payout += taikouPayout }
+          let mainHit = false, subHit = false
+          let mainPay = 0, subPay = 0
+
+          if (use3tan) {
+            mainHit = pred.sanrentan === actual.trifecta
+            mainPay = mainHit ? getPayout(result, 'trifecta', actual.trifecta) : 0
+            subHit = false
+          } else {
+            mainHit = pred.honmei === actual.exacta
+            mainPay = mainHit ? getPayout(result, 'exacta', actual.exacta) : 0
+            subHit = pred.taikou === actual.exacta
+            subPay = subHit ? getPayout(result, 'exacta', actual.exacta) : 0
+          }
+
+          stats.main.bets++
+          if (mainHit) { stats.main.wins++; stats.main.payout += mainPay }
+          if (!use3tan) {
+            stats.sub.bets++
+            if (subHit) { stats.sub.wins++; stats.sub.payout += subPay }
+          }
+
+          if (!stats.byVenue[venueName]) stats.byVenue[venueName] = { bets:0,wins:0,invest:0,payout:0 }
+          stats.byVenue[venueName].bets += use3tan ? 1 : 2
+          stats.byVenue[venueName].invest += use3tan ? 100 : 200
+          if (mainHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += mainPay }
+          if (!use3tan && subHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += subPay }
+
+          if (!stats.byRaceNo[raceNo]) stats.byRaceNo[raceNo] = { bets:0,wins:0,invest:0,payout:0 }
+          stats.byRaceNo[raceNo].bets += use3tan ? 1 : 2
+          stats.byRaceNo[raceNo].invest += use3tan ? 100 : 200
+          if (mainHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += mainPay }
+          if (!use3tan && subHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += subPay }
+
+          if (!stats.monthly[month]) stats.monthly[month] = { bets:0,wins:0,invest:0,payout:0 }
+          stats.monthly[month].bets += use3tan ? 1 : 2
+          stats.monthly[month].invest += use3tan ? 100 : 200
+          if (mainHit) { stats.monthly[month].wins++; stats.monthly[month].payout += mainPay }
+          if (!use3tan && subHit) { stats.monthly[month].wins++; stats.monthly[month].payout += subPay }
         }
 
-        if ((i+1) % 5 === 0) addLog(`${dateStr}: ${stats.totalRaces}レース処理済み`)
-
-      } catch (e) {
-        // スキップ
-      }
+        if ((i+1) % 5 === 0) addLog(`${dateStr}: ベット${stats.bettedRaces}/${stats.totalRaces}レース`)
+      } catch { /* スキップ */ }
 
       await new Promise(r => setTimeout(r, 100))
     }
 
-    setResult(stats)
+    setResult({ ...stats, strategy, use3tan })
     setRunning(false)
     addLog('✅ バックテスト完了！')
   }
 
-  const totalInvest = result ? result.totalRaces * 200 : 0
-  const totalPayout = result ? result.honmei.payout + result.taikou.payout : 0
+  const use3tan = strategy === '3'
+  const totalInvest = result ? (result.main.bets + (result.use3tan ? 0 : result.sub.bets)) * 100 : 0
+  const totalPayout = result ? result.main.payout + result.sub.payout : 0
 
   return (
     <div style={{ position:'relative', zIndex:1, maxWidth:1080, margin:'0 auto', padding:'24px 16px 80px' }}>
@@ -203,14 +269,28 @@ export default function BacktestPage() {
         <div style={{ width:42, height:42, background:'linear-gradient(135deg,#cc2233,#ff4455)', borderRadius:10, display:'flex', alignItems:'center', justifyContent:'center', fontSize:'1.3rem' }}>📊</div>
         <div>
           <div style={{ fontFamily:'monospace', fontSize:'1.6rem', color:'#fff' }}>BACK<span style={{ color:'var(--red)' }}>TEST</span></div>
-          <div style={{ fontSize:'.54rem', letterSpacing:'.2em', color:'var(--tx2)', fontFamily:'monospace' }}>統計ロジック バックテスト（2連単本命・対抗）</div>
+          <div style={{ fontSize:'.54rem', letterSpacing:'.2em', color:'var(--tx2)', fontFamily:'monospace' }}>統計ロジック バックテスト</div>
         </div>
       </div>
 
       <div style={{ background:'var(--sf)', border:'1px solid var(--bd)', borderRadius:9, padding:20, marginBottom:20 }}>
+        {/* 戦略選択 */}
+        <div style={{ marginBottom:16 }}>
+          <div style={{ fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', marginBottom:8 }}>戦略選択</div>
+          <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:8 }}>
+            {STRATEGIES.map(s => (
+              <button key={s.id} onClick={() => setStrategy(s.id)}
+                style={{ padding:'10px 12px', background: strategy===s.id ? 'rgba(255,63,85,.12)' : 'var(--bg)', border:`1px solid ${strategy===s.id ? 'var(--red)' : 'var(--bd)'}`, color: strategy===s.id ? '#fff' : 'var(--tx2)', borderRadius:6, fontFamily:'monospace', fontSize:'.72rem', textAlign:'left', cursor:'pointer' }}>
+                <div style={{ color: strategy===s.id ? 'var(--red)' : 'var(--tx2)', marginBottom:3 }}>{s.label}</div>
+                <div style={{ fontSize:'.58rem', color:'var(--tx3)' }}>{s.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div style={{ display:'flex', gap:16, alignItems:'center', flexWrap:'wrap' }}>
           <div>
-            <div style={{ fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', marginBottom:6 }}>バックテスト期間</div>
+            <div style={{ fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', marginBottom:6 }}>期間</div>
             <div style={{ display:'flex', gap:8 }}>
               {[1,2,3,6].map(m => (
                 <button key={m} onClick={() => setMonths(m)}
@@ -220,13 +300,9 @@ export default function BacktestPage() {
               ))}
             </div>
           </div>
-          <div style={{ flex:1, minWidth:200 }}>
-            <div style={{ fontSize:'.58rem', color:'var(--tx2)', fontFamily:'monospace', marginBottom:6 }}>条件</div>
-            <div style={{ fontSize:'.72rem', color:'var(--tx2)' }}>全24場・全レース・2連単本命+対抗 各100円</div>
-          </div>
           <button onClick={run} disabled={running}
-            style={{ padding:'12px 24px', background: running ? 'var(--bd)' : 'linear-gradient(90deg,#cc2233,#ff4455)', border:'none', borderRadius:5, color: running ? 'var(--tx3)' : '#fff', fontFamily:'monospace', fontSize:'1rem', letterSpacing:'.1em', cursor: running ? 'not-allowed' : 'pointer' }}>
-            {running ? '⏳ 実行中...' : '▶ バックテスト実行'}
+            style={{ marginLeft:'auto', padding:'12px 28px', background: running ? 'var(--bd)' : 'linear-gradient(90deg,#cc2233,#ff4455)', border:'none', borderRadius:5, color: running ? 'var(--tx3)' : '#fff', fontFamily:'monospace', fontSize:'1rem', letterSpacing:'.1em', cursor: running ? 'not-allowed' : 'pointer' }}>
+            {running ? '⏳ 実行中...' : '▶ 実行'}
           </button>
         </div>
 
@@ -239,33 +315,34 @@ export default function BacktestPage() {
             <div style={{ height:6, background:'var(--bg)', borderRadius:3, overflow:'hidden' }}>
               <div style={{ width:`${progress.total ? (progress.current/progress.total*100) : 0}%`, height:'100%', background:'linear-gradient(90deg,#cc2233,#ff4455)', transition:'width .3s' }} />
             </div>
-            <div style={{ marginTop:8, fontSize:'.6rem', color:'var(--tx3)', fontFamily:'monospace' }}>
-              {log[log.length-1]}
-            </div>
+            <div style={{ marginTop:8, fontSize:'.6rem', color:'var(--tx3)', fontFamily:'monospace' }}>{log[log.length-1]}</div>
           </div>
         )}
       </div>
 
       {result && (
         <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
-          <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:1, background:'var(--bd)', borderRadius:9, overflow:'hidden' }}>
+          {/* サマリー */}
+          <div style={{ display:'grid', gridTemplateColumns:'repeat(5,1fr)', gap:1, background:'var(--bd)', borderRadius:9, overflow:'hidden' }}>
             {[
-              { label:'総レース数', value: result.totalRaces.toLocaleString() },
+              { label:'総レース', value: result.totalRaces.toLocaleString() },
+              { label:'ベット対象', value: result.bettedRaces.toLocaleString() },
               { label:'総投資額', value: `${totalInvest.toLocaleString()}円` },
               { label:'総回収額', value: `${totalPayout.toLocaleString()}円` },
-              { label:'総回収率', value: `${roi(totalInvest, totalPayout)}%`, color: parseFloat(roi(totalInvest, totalPayout)) >= 100 ? 'var(--grn)' : 'var(--red)' },
+              { label:'総回収率', value: `${roi(totalInvest, totalPayout)}%`, color: parseFloat(roi(totalInvest, totalPayout)) >= 100 ? 'var(--grn)' : parseFloat(roi(totalInvest, totalPayout)) >= 85 ? 'var(--warn)' : 'var(--red)' },
             ].map(({ label, value, color }) => (
-              <div key={label} style={{ background:'var(--sf)', padding:'16px 12px', textAlign:'center' }}>
-                <div style={{ fontFamily:'monospace', fontSize:'1.4rem', color: color || 'var(--ac)', lineHeight:1 }}>{value}</div>
-                <div style={{ fontSize:'.54rem', color:'var(--tx2)', fontFamily:'monospace', marginTop:4 }}>{label}</div>
+              <div key={label} style={{ background:'var(--sf)', padding:'14px 10px', textAlign:'center' }}>
+                <div style={{ fontFamily:'monospace', fontSize:'1.2rem', color: color || 'var(--ac)', lineHeight:1 }}>{value}</div>
+                <div style={{ fontSize:'.52rem', color:'var(--tx2)', fontFamily:'monospace', marginTop:4 }}>{label}</div>
               </div>
             ))}
           </div>
 
-          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+          {/* 本命・対抗 or 3連単 */}
+          <div style={{ display:'grid', gridTemplateColumns: result.use3tan ? '1fr' : '1fr 1fr', gap:12 }}>
             {[
-              { label:'2連単 本命', data: result.honmei },
-              { label:'2連単 対抗', data: result.taikou },
+              { label: result.use3tan ? '3連単 本命' : '2連単 本命', data: result.main },
+              ...(!result.use3tan ? [{ label:'2連単 対抗', data: result.sub }] : []),
             ].map(({ label, data }) => {
               const r = roi(data.bets*100, data.payout)
               const isPlus = parseFloat(r) >= 100
@@ -294,6 +371,7 @@ export default function BacktestPage() {
             })}
           </div>
 
+          {/* 月別 */}
           <div style={{ background:'var(--sf)', border:'1px solid var(--bd)', borderRadius:9, overflow:'hidden' }}>
             <div style={{ padding:'12px 16px', background:'var(--bg2)', borderBottom:'1px solid var(--bd)', fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', letterSpacing:'.14em' }}>月別成績</div>
             <div style={{ overflowX:'auto' }}>
@@ -313,7 +391,7 @@ export default function BacktestPage() {
                         <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', color:'var(--tx2)', textAlign:'right' }}>{s.wins} ({hitRate(s.wins, s.bets)}%)</td>
                         <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', color:'var(--tx2)', textAlign:'right' }}>{s.invest.toLocaleString()}円</td>
                         <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', color:'var(--tx2)', textAlign:'right' }}>{s.payout.toLocaleString()}円</td>
-                        <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', fontWeight:700, textAlign:'right', color: r >= 100 ? 'var(--grn)' : r >= 80 ? 'var(--warn)' : 'var(--red)' }}>{roi(s.invest, s.payout)}%</td>
+                        <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', fontWeight:700, textAlign:'right', color: r >= 100 ? 'var(--grn)' : r >= 85 ? 'var(--warn)' : 'var(--red)' }}>{roi(s.invest, s.payout)}%</td>
                       </tr>
                     )
                   })}
@@ -322,6 +400,7 @@ export default function BacktestPage() {
             </div>
           </div>
 
+          {/* 場別 */}
           <div style={{ background:'var(--sf)', border:'1px solid var(--bd)', borderRadius:9, overflow:'hidden' }}>
             <div style={{ padding:'12px 16px', background:'var(--bg2)', borderBottom:'1px solid var(--bd)', fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', letterSpacing:'.14em' }}>場別成績（ROI順）</div>
             <div style={{ overflowX:'auto' }}>
@@ -333,6 +412,7 @@ export default function BacktestPage() {
                 </thead>
                 <tbody>
                   {Object.entries(result.byVenue)
+                    .filter(([,s]: any) => s.bets > 0)
                     .sort(([,a]: any, [,b]: any) => (b.payout/b.invest) - (a.payout/a.invest))
                     .map(([venue, s]: any) => {
                       const r = parseFloat(roi(s.invest, s.payout))
@@ -343,7 +423,7 @@ export default function BacktestPage() {
                           <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', color:'var(--tx2)', textAlign:'right' }}>{s.wins} ({hitRate(s.wins, s.bets)}%)</td>
                           <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', color:'var(--tx2)', textAlign:'right' }}>{s.invest.toLocaleString()}円</td>
                           <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', color:'var(--tx2)', textAlign:'right' }}>{s.payout.toLocaleString()}円</td>
-                          <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', fontWeight:700, textAlign:'right', color: r >= 100 ? 'var(--grn)' : r >= 80 ? 'var(--warn)' : 'var(--red)' }}>{roi(s.invest, s.payout)}%</td>
+                          <td style={{ padding:'8px 12px', borderBottom:'1px solid var(--bd2)', fontFamily:'monospace', fontWeight:700, textAlign:'right', color: r >= 100 ? 'var(--grn)' : r >= 85 ? 'var(--warn)' : 'var(--red)' }}>{roi(s.invest, s.payout)}%</td>
                         </tr>
                       )
                     })}
@@ -352,17 +432,18 @@ export default function BacktestPage() {
             </div>
           </div>
 
+          {/* R別 */}
           <div style={{ background:'var(--sf)', border:'1px solid var(--bd)', borderRadius:9, overflow:'hidden' }}>
             <div style={{ padding:'12px 16px', background:'var(--bg2)', borderBottom:'1px solid var(--bd)', fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', letterSpacing:'.14em' }}>R別成績</div>
             <div style={{ display:'grid', gridTemplateColumns:'repeat(6,1fr)', gap:1, background:'var(--bd)' }}>
               {Array.from({length:12}, (_,i) => i+1).map(rno => {
                 const s = result.byRaceNo[rno]
-                if (!s) return <div key={rno} style={{ background:'var(--sf)', padding:'10px 8px', textAlign:'center' }}><div style={{ fontFamily:'monospace', color:'var(--tx3)' }}>{rno}R</div></div>
+                if (!s || s.bets === 0) return <div key={rno} style={{ background:'var(--sf)', padding:'10px 8px', textAlign:'center' }}><div style={{ fontFamily:'monospace', color:'var(--tx3)', fontSize:'.9rem' }}>{rno}R</div><div style={{ fontSize:'.6rem', color:'var(--tx3)' }}>-</div></div>
                 const r = parseFloat(roi(s.invest, s.payout))
                 return (
                   <div key={rno} style={{ background:'var(--sf)', padding:'10px 8px', textAlign:'center' }}>
                     <div style={{ fontFamily:'monospace', fontSize:'.9rem', color:'var(--tx2)', marginBottom:4 }}>{rno}R</div>
-                    <div style={{ fontFamily:'monospace', fontSize:'1.1rem', color: r >= 100 ? 'var(--grn)' : r >= 80 ? 'var(--warn)' : 'var(--red)', fontWeight:700 }}>{roi(s.invest, s.payout)}%</div>
+                    <div style={{ fontFamily:'monospace', fontSize:'1.1rem', color: r >= 100 ? 'var(--grn)' : r >= 85 ? 'var(--warn)' : 'var(--red)', fontWeight:700 }}>{roi(s.invest, s.payout)}%</div>
                     <div style={{ fontSize:'.54rem', color:'var(--tx3)', marginTop:2 }}>{hitRate(s.wins, s.bets)}%的中</div>
                   </div>
                 )
