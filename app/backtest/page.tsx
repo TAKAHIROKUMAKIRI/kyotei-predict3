@@ -1,7 +1,7 @@
 'use client'
 
 import { useState } from 'react'
-import { VENUES, VENUE_DATA, LANE_COLORS } from '@/lib/venues'
+import { VENUE_DATA } from '@/lib/venues'
 
 const VENUE_NAMES: Record<number, string> = {
   1:'桐生',2:'戸田',3:'江戸川',4:'平和島',5:'多摩川',6:'浜名湖',
@@ -47,7 +47,7 @@ function predict(boats: any[], venueName: string, raceNo: number) {
 function getActualResult(resultRace: any) {
   if (!resultRace?.boats) return null
   const sorted = [...resultRace.boats].sort((a: any, b: any) =>
-    (a.result_arrival ?? a.arrival ?? 99) - (b.result_arrival ?? b.arrival ?? 99)
+    (a.racer_place_number ?? 99) - (b.racer_place_number ?? 99)
   )
   const first = sorted[0]?.racer_boat_number
   const second = sorted[1]?.racer_boat_number
@@ -56,13 +56,9 @@ function getActualResult(resultRace: any) {
 }
 
 function getExactaPayout(result: any, combo: string) {
-  if (!result?.payouts) return 0
-  for (const p of result.payouts) {
-    const type = p.bet_type || p.type || ''
-    const comb = String(p.combination || p.result || '')
-    if ((type.includes('2t') || type.includes('exacta') || type.includes('2連単')) && comb === combo) {
-      return parseInt(p.payout || p.amount || 0)
-    }
+  if (!result?.payouts?.exacta) return 0
+  for (const p of result.payouts.exacta) {
+    if (p.combination === combo) return parseInt(p.payout || 0)
   }
   return 0
 }
@@ -119,8 +115,6 @@ export default function BacktestPage() {
       monthly: {} as Record<string, any>,
     }
 
-    let processed = 0
-
     for (let i = 0; i < dates.length; i++) {
       const dateStr = dates[i]
       const year = dateStr.slice(0,4)
@@ -136,7 +130,7 @@ export default function BacktestPage() {
         if (!programData || !resultData) continue
 
         const programs = programData.programs || []
-        const results = (resultData.results || resultData.programs || [])
+        const results = resultData.results || resultData.programs || []
 
         const resultMap = new Map()
         for (const r of results) {
@@ -158,35 +152,35 @@ export default function BacktestPage() {
 
           const honmeiHit = pred.honmei === actualCombo
           const taikouHit = pred.taikou === actualCombo
-          const payout = honmeiHit || taikouHit ? getExactaPayout(result, actualCombo) : 0
+          const honmeiPayout = honmeiHit ? getExactaPayout(result, actualCombo) : 0
+          const taikouPayout = taikouHit ? getExactaPayout(result, actualCombo) : 0
 
           stats.honmei.bets++
           stats.taikou.bets++
-          if (honmeiHit) { stats.honmei.wins++; stats.honmei.payout += payout }
-          if (taikouHit) { stats.taikou.wins++; stats.taikou.payout += payout }
+          if (honmeiHit) { stats.honmei.wins++; stats.honmei.payout += honmeiPayout }
+          if (taikouHit) { stats.taikou.wins++; stats.taikou.payout += taikouPayout }
           stats.totalRaces++
 
           if (!stats.byVenue[venueName]) stats.byVenue[venueName] = { bets:0, wins:0, invest:0, payout:0 }
           stats.byVenue[venueName].bets += 2
           stats.byVenue[venueName].invest += 200
-          if (honmeiHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += payout }
-          if (taikouHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += payout }
+          if (honmeiHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += honmeiPayout }
+          if (taikouHit) { stats.byVenue[venueName].wins++; stats.byVenue[venueName].payout += taikouPayout }
 
           if (!stats.byRaceNo[raceNo]) stats.byRaceNo[raceNo] = { bets:0, wins:0, invest:0, payout:0 }
           stats.byRaceNo[raceNo].bets += 2
           stats.byRaceNo[raceNo].invest += 200
-          if (honmeiHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += payout }
-          if (taikouHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += payout }
+          if (honmeiHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += honmeiPayout }
+          if (taikouHit) { stats.byRaceNo[raceNo].wins++; stats.byRaceNo[raceNo].payout += taikouPayout }
 
           if (!stats.monthly[month]) stats.monthly[month] = { bets:0, wins:0, invest:0, payout:0 }
           stats.monthly[month].bets += 2
           stats.monthly[month].invest += 200
-          if (honmeiHit) { stats.monthly[month].wins++; stats.monthly[month].payout += payout }
-          if (taikouHit) { stats.monthly[month].wins++; stats.monthly[month].payout += payout }
+          if (honmeiHit) { stats.monthly[month].wins++; stats.monthly[month].payout += honmeiPayout }
+          if (taikouHit) { stats.monthly[month].wins++; stats.monthly[month].payout += taikouPayout }
         }
 
-        processed++
-        if (processed % 5 === 0) addLog(`${dateStr}: ${stats.totalRaces}レース処理済み`)
+        if ((i+1) % 5 === 0) addLog(`${dateStr}: ${stats.totalRaces}レース処理済み`)
 
       } catch (e) {
         // スキップ
@@ -220,7 +214,7 @@ export default function BacktestPage() {
             <div style={{ display:'flex', gap:8 }}>
               {[1,2,3,6].map(m => (
                 <button key={m} onClick={() => setMonths(m)}
-                  style={{ padding:'8px 16px', background: months===m ? 'rgba(255,63,85,.1)' : 'var(--bg)', border:`1px solid ${months===m ? 'var(--red)' : 'var(--bd)'}`, color: months===m ? 'var(--red)' : 'var(--tx2)', borderRadius:5, fontFamily:'monospace', fontSize:'.8rem' }}>
+                  style={{ padding:'8px 16px', background: months===m ? 'rgba(255,63,85,.1)' : 'var(--bg)', border:`1px solid ${months===m ? 'var(--red)' : 'var(--bd)'}`, color: months===m ? 'var(--red)' : 'var(--tx2)', borderRadius:5, fontFamily:'monospace', fontSize:'.8rem', cursor:'pointer' }}>
                   {m}ヶ月
                 </button>
               ))}
@@ -231,7 +225,7 @@ export default function BacktestPage() {
             <div style={{ fontSize:'.72rem', color:'var(--tx2)' }}>全24場・全レース・2連単本命+対抗 各100円</div>
           </div>
           <button onClick={run} disabled={running}
-            style={{ padding:'12px 24px', background: running ? 'var(--bd)' : 'linear-gradient(90deg,#cc2233,#ff4455)', border:'none', borderRadius:5, color: running ? 'var(--tx3)' : '#fff', fontFamily:'monospace', fontSize:'1rem', letterSpacing:'.1em' }}>
+            style={{ padding:'12px 24px', background: running ? 'var(--bd)' : 'linear-gradient(90deg,#cc2233,#ff4455)', border:'none', borderRadius:5, color: running ? 'var(--tx3)' : '#fff', fontFamily:'monospace', fontSize:'1rem', letterSpacing:'.1em', cursor: running ? 'not-allowed' : 'pointer' }}>
             {running ? '⏳ 実行中...' : '▶ バックテスト実行'}
           </button>
         </div>
@@ -254,7 +248,6 @@ export default function BacktestPage() {
 
       {result && (
         <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
-          {/* サマリー */}
           <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:1, background:'var(--bd)', borderRadius:9, overflow:'hidden' }}>
             {[
               { label:'総レース数', value: result.totalRaces.toLocaleString() },
@@ -269,7 +262,6 @@ export default function BacktestPage() {
             ))}
           </div>
 
-          {/* 本命・対抗 */}
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
             {[
               { label:'2連単 本命', data: result.honmei },
@@ -302,14 +294,13 @@ export default function BacktestPage() {
             })}
           </div>
 
-          {/* 月別 */}
           <div style={{ background:'var(--sf)', border:'1px solid var(--bd)', borderRadius:9, overflow:'hidden' }}>
             <div style={{ padding:'12px 16px', background:'var(--bg2)', borderBottom:'1px solid var(--bd)', fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', letterSpacing:'.14em' }}>月別成績</div>
             <div style={{ overflowX:'auto' }}>
               <table style={{ width:'100%', borderCollapse:'collapse', fontSize:'.76rem' }}>
                 <thead>
                   <tr>{['月','ベット','的中','投資額','回収額','ROI'].map(h => (
-                    <th key={h} style={{ background:'var(--bg)', color:'var(--tx2)', fontFamily:'monospace', fontSize:'.56rem', padding:'8px 12px', borderBottom:'1px solid var(--bd)', textAlign:'right', whiteSpace:'nowrap' }}>{h}</th>
+                    <th key={h} style={{ background:'var(--bg)', color:'var(--tx2)', fontFamily:'monospace', fontSize:'.56rem', padding:'8px 12px', borderBottom:'1px solid var(--bd)', textAlign:'right' }}>{h}</th>
                   ))}</tr>
                 </thead>
                 <tbody>
@@ -331,14 +322,13 @@ export default function BacktestPage() {
             </div>
           </div>
 
-          {/* 場別 */}
           <div style={{ background:'var(--sf)', border:'1px solid var(--bd)', borderRadius:9, overflow:'hidden' }}>
             <div style={{ padding:'12px 16px', background:'var(--bg2)', borderBottom:'1px solid var(--bd)', fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', letterSpacing:'.14em' }}>場別成績（ROI順）</div>
             <div style={{ overflowX:'auto' }}>
               <table style={{ width:'100%', borderCollapse:'collapse', fontSize:'.76rem' }}>
                 <thead>
                   <tr>{['場名','ベット','的中','投資額','回収額','ROI'].map(h => (
-                    <th key={h} style={{ background:'var(--bg)', color:'var(--tx2)', fontFamily:'monospace', fontSize:'.56rem', padding:'8px 12px', borderBottom:'1px solid var(--bd)', textAlign:'right', whiteSpace:'nowrap' }}>{h}</th>
+                    <th key={h} style={{ background:'var(--bg)', color:'var(--tx2)', fontFamily:'monospace', fontSize:'.56rem', padding:'8px 12px', borderBottom:'1px solid var(--bd)', textAlign:'right' }}>{h}</th>
                   ))}</tr>
                 </thead>
                 <tbody>
@@ -362,7 +352,6 @@ export default function BacktestPage() {
             </div>
           </div>
 
-          {/* R別 */}
           <div style={{ background:'var(--sf)', border:'1px solid var(--bd)', borderRadius:9, overflow:'hidden' }}>
             <div style={{ padding:'12px 16px', background:'var(--bg2)', borderBottom:'1px solid var(--bd)', fontSize:'.6rem', color:'var(--tx2)', fontFamily:'monospace', letterSpacing:'.14em' }}>R別成績</div>
             <div style={{ display:'grid', gridTemplateColumns:'repeat(6,1fr)', gap:1, background:'var(--bd)' }}>
